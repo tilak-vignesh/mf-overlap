@@ -1,0 +1,87 @@
+# ai-shi — Mutual Fund Overlap & Concentration Agent
+
+An agentic system that takes a person's mutual fund holdings (fund names, or a
+folio/consolidated statement), resolves the underlying stock holdings of each
+fund, and calculates overlap between funds — flagging concentration risk (e.g.
+the same large-cap stock showing up at high weight across "different" funds).
+
+This is a research/analysis agent, not a trading agent. **No autonomous trade
+or order execution anywhere in scope.**
+
+## Architecture
+
+```
+User input (fund names / portfolio list)
+        |
+Agent orchestrator (app/agent) — decides what to fetch, match, compute
+        |
+Tool layer (app/tools) — deterministic, each returns structured data or a
+                          clear typed failure:
+  - search_fund(query)       resolves fund name -> fund_id via live search
+  - fetch_holdings(fund_id)  cache-first (once/day), falls back to scrapers
+  - scrapers/*                one scraper per data source (Groww implemented;
+                               AMFI, Value Research, Moneycontrol stubs)
+  - compute_overlap(a, b)    sum(min(weight_i, weight_j)) over common stocks
+  - compute_concentration()  aggregate weighted exposure per stock across a
+                              whole portfolio
+        |
+Output: overlap %, concentration flags, narrative explanation from the LLM's
+own output turn (no separate "summarize" tool)
+```
+
+Retry/fallback across data sources is the agent's judgment call — `fetch_holdings`
+tries scrapers in order and reports success/failure/incompleteness back to the
+agent, which decides whether to try the next source or surface the failure to
+the user.
+
+## Stack
+
+- **FastAPI** — API layer (`app/api`)
+- **SQLite (WAL mode)**, async via `aiosqlite` — `funds`, `stocks`,
+  `holdings_cache` tables (`app/models`). No user accounts / no per-user
+  writes; the only writes are the shared daily holdings-cache refresh, so a
+  single SQLite file in WAL mode (concurrent reads, serialized rare writes)
+  is a better fit here than a Postgres server. See `design.md` for the
+  full reasoning and the schema.
+- **Prefect** — scheduled cache-refresh jobs (`app/jobs`)
+- **Gemini API** (`google-genai`, model `gemini-3.8-flash`), hand-rolled
+  tool-calling loop (`app/agent`) — no LangGraph/CrewAI for v1
+
+## Data sourcing
+
+No clean official real-time API for Indian MF holdings exists. Groww exposes
+unofficial-but-usable JSON endpoints (fund search + a fund-detail endpoint
+that includes a full weighted holdings list) and is the only implemented
+scraper today. AMFI's monthly disclosure files, Value Research, and
+Moneycontrol remain stubs. See `design.md` for the actual endpoints and the
+quirks found while integrating them.
+
+## Non-goals (v1)
+
+- No trade execution / order placement
+- No real-time/intraday data — the underlying disclosure is monthly-ish
+  regardless of how often we check it
+- No agent framework (LangGraph/CrewAI) — hand-roll the loop first
+- No user accounts / no per-user persisted state
+
+## Setup
+
+```bash
+pip install -e ".[dev]"
+cp .env.example .env   # fill in DATABASE_URL, GEMINI_API_KEY
+uvicorn app.main:app --reload
+pytest
+```
+
+## Status
+
+Working end-to-end for a single query: `POST /portfolio/analyze` with a
+free-text message resolves fund names, fetches live holdings (Groww),
+computes overlap/concentration, and has Gemini narrate the result — verified
+structurally via `TestClient` (real network + real SQLite), not yet against
+a live model response (needs `GEMINI_API_KEY`, see `design.md` §4).
+
+Still stubs: AMFI/Value Research/Moneycontrol scrapers (only Groww is real),
+the Prefect daily refresh job, and portfolio-side weighting (how much of the
+user's money is in each fund — currently supplied by the caller per
+request, no persistence, see `design.md` §4).
