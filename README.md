@@ -11,32 +11,39 @@ or order execution anywhere in scope.**
 ## Architecture
 
 ```
-User input (fund names / portfolio list)
+Interactive CLI (app/cli.py) — the only interface
         |
-Agent orchestrator (app/agent) — decides what to fetch, match, compute
+Coordinator agent (app/agent/orchestrator.py) — owns the conversation with
+the user (client-side history, held in-process by the CLI); routes questions
+to domain specialists as tools, never answers fund questions itself
+        |
+Domain specialist(s) (app/agent/domains/) — self-contained: own prompt, own
+tools, own one-shot tool-calling loop. Today: overlap_concentration.py
+(fund overlap, portfolio concentration) and allocation_gap.py (current vs.
+target equity/debt/gold split — report-only, never names specific funds
+to buy)
         |
 Tool layer (app/tools) — deterministic, each returns structured data or a
                           clear typed failure:
-  - search_fund(query)       resolves fund name -> fund_id via live search
-  - fetch_holdings(fund_id)  cache-first (once/day), falls back to scrapers
+  - search_fund(query)             resolves fund name -> fund_id via live search
+  - fetch_holdings(fund_id)        cache-first (once/day), falls back to scrapers
+  - fetch_asset_allocation(fund_id) live equity/debt/commodity split (not cached)
   - scrapers/*                one scraper per data source (Groww implemented;
                                AMFI, Value Research, Moneycontrol stubs)
   - compute_overlap(a, b)    sum(min(weight_i, weight_j)) over common stocks
   - compute_concentration()  aggregate weighted exposure per stock across a
                               whole portfolio
-        |
-Output: overlap %, concentration flags, narrative explanation from the LLM's
-own output turn (no separate "summarize" tool)
 ```
 
-Retry/fallback across data sources is the agent's judgment call — `fetch_holdings`
-tries scrapers in order and reports success/failure/incompleteness back to the
-agent, which decides whether to try the next source or surface the failure to
-the user.
+Retry/fallback across data sources is a domain agent's judgment call —
+`fetch_holdings` tries scrapers in order and reports success/failure/
+incompleteness back to the agent, which decides whether to try the next
+source or surface the failure to the user.
 
 ## Stack
 
-- **FastAPI** — API layer (`app/api`)
+- **CLI only** (`app/cli.py`, `rich` for terminal rendering) — no HTTP
+  layer, no FastAPI
 - **SQLite (WAL mode)**, async via `aiosqlite` — `funds`, `stocks`,
   `holdings_cache` tables (`app/models`). No user accounts / no per-user
   writes; the only writes are the shared daily holdings-cache refresh, so a
@@ -45,7 +52,8 @@ the user.
   full reasoning and the schema.
 - **Prefect** — scheduled cache-refresh jobs (`app/jobs`)
 - **Gemini API** (`google-genai`, model `gemini-3.8-flash`), hand-rolled
-  tool-calling loop (`app/agent`) — no LangGraph/CrewAI for v1
+  tool-calling loop, coordinator + domain-specialist agents
+  (`app/agent`) — no LangGraph/CrewAI for v1
 
 ## Data sourcing
 
@@ -63,25 +71,28 @@ quirks found while integrating them.
   regardless of how often we check it
 - No agent framework (LangGraph/CrewAI) — hand-roll the loop first
 - No user accounts / no per-user persisted state
+- No HTTP/API layer — CLI only
 
 ## Setup
 
 ```bash
 pip install -e ".[dev]"
 cp .env.example .env   # fill in DATABASE_URL, GEMINI_API_KEY
-uvicorn app.main:app --reload
+python -m app.cli
 pytest
 ```
 
 ## Status
 
-Working end-to-end for a single query: `POST /portfolio/analyze` with a
-free-text message resolves fund names, fetches live holdings (Groww),
-computes overlap/concentration, and has Gemini narrate the result — verified
-structurally via `TestClient` (real network + real SQLite), not yet against
-a live model response (needs `GEMINI_API_KEY`, see `design.md` §4).
+Working end-to-end, verified live: the CLI resolves fund names, fetches live
+holdings/allocation data (Groww), computes overlap/concentration and
+allocation-gap analysis, and Gemini narrates the result through the
+coordinator → domain-specialist routing. Two domains exist so far:
+overlap/concentration and allocation-gap. Conversation memory works across
+turns within a CLI session.
 
 Still stubs: AMFI/Value Research/Moneycontrol scrapers (only Groww is real),
 the Prefect daily refresh job, and portfolio-side weighting (how much of the
-user's money is in each fund — currently supplied by the caller per
-request, no persistence, see `design.md` §4).
+user's money is in each fund — currently supplied per query, no
+persistence). See `design.md` §4 for candidate next domains (goal planning,
+fund performance, tax).

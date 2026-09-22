@@ -46,6 +46,19 @@ class GrowwClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def portfolio_stats(self, scheme_code: str, search_id: str) -> dict:
+        """Aggregate portfolio stats by numeric scheme_code (from scheme_detail),
+        including 'asset_allocation' (equity/debt/commodities/cash/... %) and
+        'top_holdings'/'sector' breakdowns — NOT the same payload as scheme_detail,
+        a genuinely separate endpoint. `search_id` is only used for the referer header."""
+        await self._prime()
+        resp = await self._client.get(
+            f"https://groww.in/v1/api/data/mf/web/v1/scheme/portfolio/{scheme_code}/stats",
+            headers={"referer": f"https://groww.in/mutual-funds/{search_id}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()
 

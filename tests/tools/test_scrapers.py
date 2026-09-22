@@ -31,7 +31,7 @@ async def test_fetch_reports_incomplete_holdings(monkeypatch):
         "holdings": [{"company_name": "Foo Ltd", "corpus_per": 10.0, "stock_search_id": "foo-ltd"}],
     }
     monkeypatch.setattr(
-        "app.tools.scrapers.groww.GrowwClient",
+        "app.tools.groww_lookup.GrowwClient",
         lambda: _FakeGrowwClient(candidates, detail),
     )
 
@@ -44,7 +44,7 @@ async def test_fetch_reports_incomplete_holdings(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_reports_no_match(monkeypatch):
     monkeypatch.setattr(
-        "app.tools.scrapers.groww.GrowwClient",
+        "app.tools.groww_lookup.GrowwClient",
         lambda: _FakeGrowwClient([], {}),
     )
 

@@ -126,28 +126,173 @@ with several processes hammering writes concurrently) — SQLite serializes
 writers. Given writes are ~1/fund/day, that's not a real constraint here,
 but it's the thing that would force a revisit.
 
+### 2.5 Provider: Gemini, not Claude — switched mid-build
+
+Originally built against the Anthropic SDK (`claude-opus-5`); switched to
+Google's `google-genai` SDK (`gemini-3.8-flash`) per explicit request. Key
+`GEMINI_API_KEY` from `.env` via `Settings`, not the SDK's own env
+auto-detection (pydantic-settings loads `.env` into the `Settings` object,
+not into `os.environ`). Tool schemas are defined provider-neutrally
+(`{name, description, parameters}` plain JSON schema, no Anthropic-specific
+`input_schema`/`strict` fields) so the same tool definitions work under
+either provider's SDK adapter.
+
+### 2.6 Conversation memory — client-owned, server stays stateless
+
+The agent kept proposing follow-up questions the user had no channel to
+answer (the API was single-shot request/response). Two options: server-owned
+sessions (a new DB table, session_id, expiry/cleanup — a materially
+different, more frequent write pattern than the daily fund-cache writes
+§2.4 sized SQLite around) vs. client-owned history (caller sends the full
+transcript each call, server stays fully stateless). Chose **client-owned
+history** — `run_agent(user_message, session, history=None) -> (reply,
+updated_history)`; the caller stores and resends `history` to continue a
+conversation, or omits it for a fresh one-shot query. No new DB table, no
+session state — doesn't reopen the "no per-user persisted state" decision
+in §2.4 at all. Verified live: a follow-up referencing "those two funds"
+from a prior turn resolved correctly without re-stating fund names.
+
+### 2.7 Multi-agent split: coordinator + domain specialists
+
+Initially built as one agent (one system prompt, one flat tool list) — the
+right default for a small, single-domain tool surface (see the
+Claude-vs-LangGraph/CrewAI discussion: no framework needed when there's no
+real branching or multi-persona need). As the roadmap grew to include
+domains beyond overlap/concentration (goal planning, fund performance, tax,
+risk profiling — see §4), explicitly restructured **before** adding the
+second domain, to avoid a monolith-refactor later:
+
+- **Coordinator** (`app/agent/orchestrator.py`) — the only agent the
+  outside world (API/CLI) talks to. Owns the actual multi-turn conversation
+  and `history` (§2.6). Its tools are *other agents*, not deterministic
+  functions — currently one: `consult_overlap_agent`.
+- **Domain specialist** (`app/agent/domains/overlap_concentration.py`) — a
+  self-contained module: own system prompt, own tools
+  (`search_fund`/`get_fund_overlap`/`get_portfolio_concentration`), own
+  one-shot `run(query, session) -> str`. Invoked *by* the coordinator, never
+  called directly by the user.
+- **Shared plumbing**, extracted so both levels (and every future domain)
+  reuse it rather than duplicating: `app/agent/loop.py` (`run_tool_loop` —
+  the actual hand-rolled `while`-style loop) and `app/agent/tool_registry.py`
+  (`to_gemini_tools`, `make_dispatcher` — generic helpers, no longer
+  overlap-specific despite the filename).
+
+**A real design correction made while building this, not obvious in
+advance:** the domain specialist has no direct channel to the user — the
+coordinator does. So the "ask a clarifying question" behavior from §2.6
+can't live in the domain's prompt (it has no way to relay a question
+anywhere) — it always gives its fullest answer with stated assumptions.
+The coordinator's prompt is the one that still carries "ask a clarifying
+question when it matters," since it's the one actually holding the
+conversation.
+
+**Deliberately not built yet:** an LLM-based routing decision. With exactly
+one domain, "routing" has no real decision to make — an LLM call to decide
+that would be latency/cost for a foregone conclusion. What's built now is
+the *structural* split (self-contained domain modules, a coordinator that
+calls them as tools) so the next domain is "write a new module + register
+one more coordinator tool," not a refactor of what already works.
+
+Verified live end-to-end through this restructure: same 28.25% overlap
+answer as before, now visibly routed through `consult_overlap_agent` (the
+domain specialist's own tool-calling loop runs inside the coordinator's
+tool call). At the time, both a FastAPI HTTP endpoint and the CLI worked
+against this unchanged, since `run_agent()`'s public signature didn't
+change — the FastAPI layer was removed shortly after, see §2.8.
+
+### 2.8 FastAPI removed — CLI is the only interface
+
+`app/main.py` and `app/api/` (the `GET /funds/search` and
+`POST /portfolio/analyze` HTTP routes) deleted, along with the `fastapi`
+and `uvicorn` dependencies. `pydantic` stays installed transitively via
+`pydantic-settings` (still used for `.env`/`Settings`) but is no longer a
+direct dependency — nothing imports it directly anymore. `app/cli.py` was
+already a complete, working interface calling `run_agent()` directly with
+zero HTTP involved (§2.7's restructure made a point of not touching
+`run_agent()`'s signature specifically so both interfaces kept working
+unchanged) — removing the HTTP layer was a pure deletion, not a rewrite.
+Verified after removal: CLI still imports and runs correctly, full test
+suite still passes (11 passed, 4 skipped — none of the tests depended on
+FastAPI's `TestClient`).
+
+### 2.9 Second domain: allocation-gap — report-only, no fund suggestions
+
+The user proposed: ask for a target equity/debt/gold split and risk
+tolerance, compute the current blended split from their actual funds, and
+suggest new funds to close the gap. Agreed on the first half; the second
+half (naming specific funds to buy) was deliberately scoped **out** —
+that's investment advice, not analysis, and conflicts with the project's
+own non-goals (§5) and the "no buy/sell recommendations" rule already in
+every agent's prompt. What got built: report the gap, and at most describe
+what *category* of fund would close it ("a debt fund," "a gold ETF/FoF") —
+never a specific fund name or ticker. This boundary is written directly
+into the domain's system prompt in `app/agent/domains/allocation_gap.py`,
+not left to be inferred.
+
+Structurally, this is the second instance of the §2.7 pattern: a new
+self-contained module (own prompt, own tools: `search_fund` again — each
+domain resolves fund names independently, no cross-domain state sharing —
+plus `get_allocation_gap`), registered as one more coordinator tool
+(`consult_allocation_gap_agent`). No changes needed to the coordinator's
+core loop, `overlap_concentration.py`, or any shared plumbing beyond adding
+the new tool entry — exactly the "not a refactor" claim from §2.7 held up
+in practice.
+
+**A real bug found and fixed while building this, not obvious in
+advance:** the plan was to read `asset_allocation` off the same
+`scheme_detail` payload `fetch_holdings` already pulls holdings from — a
+field I recalled seeing in this payload earlier in the build. Live-checked
+before trusting that recollection: `scheme_detail`'s actual key list has no
+`asset_allocation` field at all (confirmed by printing every key). The
+field only exists on a *separate* endpoint,
+`GET .../v1/api/data/mf/web/v1/scheme/portfolio/{scheme_code}/stats`
+(keyed by the fund's numeric `scheme_code`, not its slug) — the same
+endpoint explored right at the start of this build (§2.1) and then
+forgotten when this feature was designed. First live test of the new
+domain caught this immediately: it returned confident-sounding but
+entirely fabricated "~65-75% equity" range estimates instead of real
+numbers, because the underlying tool call was silently getting back all
+zeros and the model was covering for missing data with background
+knowledge about what these fund *categories* typically hold. Fixed by
+adding `GrowwClient.portfolio_stats()` and
+`groww_lookup.find_asset_allocation()` (a genuinely separate lookup
+path, factored to share the search+fuzzy-match step with
+`find_scheme_detail()` via `_find_best_candidate()`). Re-verified live
+after the fix: real numbers matching the exact values confirmed against
+the raw API earlier (Parag Parikh Flexi Cap: 82.24% equity, 6.26% debt) —
+not estimates.
+
+**Also confirmed, still holding:** Groww has no dedicated "gold" field —
+`commodities` (a broader bucket) is the only proxy, and both the tool
+output and the domain's prompt say so explicitly rather than presenting it
+as a precise gold-only figure.
+
 ## 3. System design (implemented as of this writing)
 
 ### 3.1 Components
 
 ```
-Browser clients (no auth, no accounts)
+Interactive CLI (app/cli.py) — the only interface (§2.8: FastAPI removed)
         |
-        v  read-mostly HTTP
-FastAPI app (app/main.py)
-  - GET /funds/search?query=...        -> search_fund
-  - POST /portfolio/analyze             -> agent orchestrator
+        v  direct in-process call, history held by the CLI loop
+Coordinator agent (app/agent/orchestrator.py) — owns the conversation with
+the user (client-owned `history`, §2.6); routes to domain specialists as
+tools, never answers fund questions itself.
         |
         v
-Agent orchestrator (app/agent) — hand-rolled Anthropic tool-calling loop.
-Decides what to fetch/match/compute; delegates deterministic work to tools.
+Domain specialist(s) (app/agent/domains/) — self-contained: own prompt, own
+tools, own one-shot loop. Today: overlap_concentration.py and
+allocation_gap.py (§2.9) — see §4 for what's next.
         |
         v
 Tool layer (app/tools), each returns structured data or a typed failure:
-  - search_fund(query)         Groww name search -> upsert into `funds`,
-                                ranked (fund_id, name, score)
-  - fetch_holdings(fund_id)    day-scoped cache check -> scraper fallback
-                                chain -> persist -> return
+  - search_fund(query)             Groww name search -> upsert into
+                                    `funds`, ranked (fund_id, name, score)
+  - fetch_holdings(fund_id)        day-scoped cache check -> scraper
+                                    fallback chain -> persist -> return
+  - fetch_asset_allocation(fund_id) live (not cached), equity/debt/
+                                    commodity/other split — separate Groww
+                                    endpoint from fetch_holdings (§2.9)
   - scrapers/groww.py          IMPLEMENTED — Groww JSON endpoints
   - scrapers/amfi.py           stub
   - scrapers/value_research.py stub
@@ -246,60 +391,42 @@ once per calendar day**, tracked via `fetched_at`, independent of whatever
 - **AMFI as a second real scraper.** Still a stub. Worth doing next since
   it's the brief's originally-preferred primary source and gives us a real
   fallback (currently `fetch_holdings` has exactly one working source).
-- **Agent orchestrator — done.** `app/agent/orchestrator.py` is a hand-rolled
-  `while`-style loop (manual, no agent framework — per §2 of the original
-  brief). It exposes three tools to the model (`app/agent/tool_registry.py`
-  + `app/agent/tools.py`), defined provider-neutrally as
-  `{name, description, parameters}` (plain JSON schema):
-  - `search_fund(query)` — thin wrapper over the existing tool
-  - `get_fund_overlap(fund_id_a, fund_id_b)` — internally calls
-    `fetch_holdings` for both funds + `compute_overlap`, returns the overlap
-    % plus the top 5 shared holdings for narrative color
-  - `get_portfolio_concentration(fund_ids, weights)` — internally calls
-    `fetch_holdings` per fund + `compute_concentration`, returns the top 10
-    stock exposures
+- **Agent orchestrator/coordinator/domain split — done, verified live.**
+  See §2.5 (Gemini switch), §2.6 (conversation memory), §2.7 (multi-agent
+  restructure) for the full history. Current state: `app/agent/orchestrator.py`
+  is the coordinator (owns the conversation, routes via tools-as-agents);
+  `app/agent/domains/overlap_concentration.py` is the one domain specialist
+  so far, exposing `search_fund` / `get_fund_overlap` /
+  `get_portfolio_concentration` to itself.
 
-  **Why composed tools instead of exposing `fetch_holdings`/`compute_*`
-  directly to the model:** those return/require raw `{stock_id: weight}`
-  dicts of 60-300+ entries per fund — shuttling that through model context
-  as tool input/output would burn tokens for data the model never needs to
-  see; it only needs the final percentages and a handful of named
-  contributors to narrate from. The underlying deterministic
-  `compute_overlap`/`compute_concentration` in `app/tools/` are unchanged
-  and still directly unit-tested.
+  **Why `get_fund_overlap`/`get_portfolio_concentration` are composed tools**
+  instead of exposing `fetch_holdings`/`compute_*` directly to the model:
+  those return/require raw `{stock_id: weight}` dicts of 60-300+ entries per
+  fund — shuttling that through model context would burn tokens for data
+  the model never needs to see; it only needs final percentages and a
+  handful of named contributors to narrate from. The underlying
+  deterministic `compute_overlap`/`compute_concentration` in `app/tools/`
+  are unchanged and still directly unit-tested.
 
-  **Model provider: Gemini, not Claude — switched mid-build.** Originally
-  built against the Anthropic SDK (`claude-opus-5`, manual loop per
-  `tool_use`/`tool_result` blocks); switched to Google's `google-genai` SDK
-  (`gemini-3.8-flash`, chosen because Google's own docs describe it as
-  "engineered for long-horizon software engineering, autonomous agents" —
-  a better fit than the `-pro-preview` tier, which is a preview model) per
-  explicit request, with the key read via `Settings.gemini_api_key` from
-  `.env` (not the SDK's own env auto-detection, since pydantic-settings
-  loads `.env` into the `Settings` object, not into `os.environ`). The
-  provider swap only touched `app/agent/orchestrator.py` and the schema
-  shape in `tool_registry.py` (Anthropic's `input_schema`/`strict` fields
-  → a plain `parameters` JSON-schema dict, since Gemini's SDK takes a
-  differently-shaped tool definition) — `app/agent/tools.py` (the actual
-  tool logic) and everything below it were untouched, since `dispatch()`
-  was already provider-agnostic.
-
-  Verified structurally end-to-end via FastAPI's `TestClient` (no live
-  Gemini credentials in this environment): `POST /portfolio/analyze`
-  correctly reaches the orchestrator, builds the request, and fails only at
-  the SDK's own client-construction step (`genai.Client(api_key=...)`
-  raises `ValueError: No API key was provided` since `GEMINI_API_KEY` isn't
-  set here) — routing, request parsing, DB session injection, and message
-  construction all confirmed working. **Not yet verified against a live
-  model response** — run it yourself with a real key to confirm the full
-  tool-calling round trip and the narrative output quality.
+  Verified fully live (not just structurally): real Gemini responses
+  through the coordinator via the CLI, correct 28.25% overlap number,
+  multi-turn follow-ups resolving correctly using client-owned `history`,
+  and the coordinator→domain routing confirmed by inspecting the actual
+  answer content.
+- **Further domains beyond overlap/concentration and allocation-gap (§2.9)**
+  — not yet built. Candidates still on the table: goal planning / SIP
+  projection (deterministic math, no new data source), fund performance &
+  quality (needs historical NAV time series — this is where TimescaleDB,
+  mentioned as optional in §1, would actually become relevant), tax
+  awareness (India-specific: LTCG/STCG, ELSS lock-in, direct-vs-regular
+  expense drag). Allocation-gap already covers the "risk profiling via
+  target split" idea, report-only per §2.9's scope decision.
 - **Portfolio-side weighting** (how much of the *user's* money is in each
   fund, as opposed to each fund's internal stock weights). Discussed
   separately: no schema for this yet. Given the "no accounts, no per-user
-  state" decision above (2.4), this will need to be supplied by the caller
-  per-request (e.g. in the `POST /portfolio/analyze` body) rather than
-  persisted — consistent with the stateless design, but not yet designed
-  in detail.
+  state" decision above (2.4), this will need to be supplied by the user in
+  their CLI message each time rather than persisted — consistent with the
+  stateless design, but not yet designed in detail.
 - **Prefect daily refresh job** (`app/jobs/refresh_cache.py`): still a
   stub; needs to decide which funds to proactively refresh (all funds ever
   requested? a fixed popular-funds list?).
