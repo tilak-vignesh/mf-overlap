@@ -4,7 +4,6 @@ import pytest
 
 from app.agent.domains import allocation_gap
 from app.agent.domains.allocation_gap import TOOLS, dispatch
-from app.tools.groww_lookup import FundLookupError
 
 
 def test_tool_schemas_are_valid_shape():
@@ -18,12 +17,26 @@ def test_tool_schemas_are_valid_shape():
 async def test_get_allocation_gap_blends_and_computes_gap(monkeypatch):
     fund_a, fund_b = str(uuid.uuid4()), str(uuid.uuid4())
 
-    async def fake_fetch(fund_id, session):
-        if str(fund_id) == fund_a:
-            return {"fund_name": "Fund A", "equity_pct": 90.0, "debt_pct": 5.0, "gold_commodity_pct": 0.0, "other_pct": 5.0}
-        return {"fund_name": "Fund B", "equity_pct": 10.0, "debt_pct": 80.0, "gold_commodity_pct": 5.0, "other_pct": 5.0}
+    async def fake_fetch_many(fund_ids, session):
+        allocs = {
+            uuid.UUID(fund_a): {
+                "fund_name": "Fund A",
+                "equity_pct": 90.0,
+                "debt_pct": 5.0,
+                "gold_commodity_pct": 0.0,
+                "other_pct": 5.0,
+            },
+            uuid.UUID(fund_b): {
+                "fund_name": "Fund B",
+                "equity_pct": 10.0,
+                "debt_pct": 80.0,
+                "gold_commodity_pct": 5.0,
+                "other_pct": 5.0,
+            },
+        }
+        return {fid: allocs[fid] for fid in fund_ids}, {}
 
-    monkeypatch.setattr("app.agent.domains.allocation_gap.fetch_asset_allocation", fake_fetch)
+    monkeypatch.setattr("app.agent.domains.allocation_gap.fetch_asset_allocation_many", fake_fetch_many)
 
     result = await dispatch(
         "get_allocation_gap",
@@ -47,10 +60,10 @@ async def test_get_allocation_gap_blends_and_computes_gap(monkeypatch):
 async def test_get_allocation_gap_reports_warning_on_lookup_failure(monkeypatch):
     fund_id = str(uuid.uuid4())
 
-    async def fake_fetch(fund_id, session):
-        raise FundLookupError("fund not found")
+    async def fake_fetch_many(fund_ids, session):
+        return {}, {uuid.UUID(fund_id): "fund not found"}
 
-    monkeypatch.setattr("app.agent.domains.allocation_gap.fetch_asset_allocation", fake_fetch)
+    monkeypatch.setattr("app.agent.domains.allocation_gap.fetch_asset_allocation_many", fake_fetch_many)
 
     result = await dispatch(
         "get_allocation_gap",

@@ -13,6 +13,7 @@ from rich.markdown import Markdown
 import app.models  # noqa: F401 — registers models on Base before create_all
 from app.agent.orchestrator import run_agent
 from app.db import Base, async_session, engine
+from app.tools.groww_client import close_shared_client
 
 EXIT_COMMANDS = {"exit", "quit", ":q", "/exit"}
 
@@ -57,6 +58,8 @@ async def main() -> None:
 
             console.print(Markdown(reply))
             console.print()
+
+    await close_shared_client()
 
 
 if __name__ == "__main__":

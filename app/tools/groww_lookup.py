@@ -2,7 +2,7 @@ import re
 
 from rapidfuzz import fuzz
 
-from app.tools.groww_client import GrowwClient
+from app.tools.groww_client import GrowwClient, get_shared_client
 
 MIN_MATCH_SCORE = 60
 
@@ -43,12 +43,12 @@ async def find_scheme_detail(fund_name: str, min_match_score: int = MIN_MATCH_SC
     """Search Groww by name, fuzzy-match the best candidate, and return its
     full scheme detail payload (metadata + holdings). Raises FundLookupError
     with a human-readable reason on any failure."""
-    async with GrowwClient() as client:
-        best = await _find_best_candidate(client, fund_name, min_match_score)
-        try:
-            return await client.scheme_detail(best["search_id"])
-        except Exception as exc:
-            raise FundLookupError(f"detail request failed: {exc}") from exc
+    client = get_shared_client()
+    best = await _find_best_candidate(client, fund_name, min_match_score)
+    try:
+        return await client.scheme_detail(best["search_id"])
+    except Exception as exc:
+        raise FundLookupError(f"detail request failed: {exc}") from exc
 
 
 async def find_asset_allocation(fund_name: str, min_match_score: int = MIN_MATCH_SCORE) -> dict:
@@ -58,23 +58,23 @@ async def find_asset_allocation(fund_name: str, min_match_score: int = MIN_MATCH
     stats, keyed by the fund's numeric scheme_code, not its slug) — not just
     a different field of the same payload. Raises FundLookupError with a
     human-readable reason on any failure."""
-    async with GrowwClient() as client:
-        best = await _find_best_candidate(client, fund_name, min_match_score)
-        try:
-            detail = await client.scheme_detail(best["search_id"])
-        except Exception as exc:
-            raise FundLookupError(f"detail request failed: {exc}") from exc
+    client = get_shared_client()
+    best = await _find_best_candidate(client, fund_name, min_match_score)
+    try:
+        detail = await client.scheme_detail(best["search_id"])
+    except Exception as exc:
+        raise FundLookupError(f"detail request failed: {exc}") from exc
 
-        scheme_code = detail.get("scheme_code")
-        if not scheme_code:
-            raise FundLookupError("no scheme_code in detail response")
+    scheme_code = detail.get("scheme_code")
+    if not scheme_code:
+        raise FundLookupError("no scheme_code in detail response")
 
-        try:
-            stats = await client.portfolio_stats(scheme_code, best["search_id"])
-        except Exception as exc:
-            raise FundLookupError(f"portfolio stats request failed: {exc}") from exc
+    try:
+        stats = await client.portfolio_stats(scheme_code, best["search_id"])
+    except Exception as exc:
+        raise FundLookupError(f"portfolio stats request failed: {exc}") from exc
 
-        return {
-            "scheme_name": detail.get("scheme_name"),
-            "asset_allocation": stats.get("asset_allocation") or {},
-        }
+    return {
+        "scheme_name": detail.get("scheme_name"),
+        "asset_allocation": stats.get("asset_allocation") or {},
+    }

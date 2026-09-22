@@ -7,7 +7,7 @@ from app.models.fund import Fund
 from app.models.stock import Stock
 from app.tools.compute_concentration import compute_concentration
 from app.tools.compute_overlap import compute_overlap
-from app.tools.fetch_holdings import fetch_holdings
+from app.tools.fetch_holdings import fetch_holdings_many
 from app.tools.search_fund import search_fund as _search_fund
 
 TOP_N_STOCKS = 10
@@ -29,8 +29,9 @@ async def get_fund_overlap(session: AsyncSession, fund_id_a: str, fund_id_b: str
     if fund_a is None or fund_b is None:
         return {"error": "unknown fund_id — call search_fund first to resolve fund names to ids"}
 
-    holdings_a = await fetch_holdings(fund_a.fund_id, session)
-    holdings_b = await fetch_holdings(fund_b.fund_id, session)
+    holdings = await fetch_holdings_many([fund_a.fund_id, fund_b.fund_id], session)
+    holdings_a = holdings[fund_a.fund_id]
+    holdings_b = holdings[fund_b.fund_id]
     weights_a = {h.stock_id: float(h.weight) for h in holdings_a}
     weights_b = {h.stock_id: float(h.weight) for h in holdings_b}
 
@@ -62,18 +63,20 @@ async def get_portfolio_concentration(session: AsyncSession, fund_ids: list[str]
         return {"error": "fund_ids and weights must be the same length"}
 
     fund_uuids = [uuid.UUID(f) for f in fund_ids]
-    fund_holdings: dict[uuid.UUID, dict[uuid.UUID, float]] = {}
-    fund_portfolio_weights: dict[uuid.UUID, float] = {}
     fund_names: dict[uuid.UUID, str] = {}
+    fund_portfolio_weights: dict[uuid.UUID, float] = {}
 
     for fund_id, weight in zip(fund_uuids, weights):
         fund = await session.get(Fund, fund_id)
         if fund is None:
             return {"error": f"unknown fund_id {fund_id} — call search_fund first to resolve fund names to ids"}
         fund_names[fund_id] = fund.name
-        holdings = await fetch_holdings(fund_id, session)
-        fund_holdings[fund_id] = {h.stock_id: float(h.weight) for h in holdings}
         fund_portfolio_weights[fund_id] = weight
+
+    holdings_by_fund = await fetch_holdings_many(fund_uuids, session)
+    fund_holdings: dict[uuid.UUID, dict[uuid.UUID, float]] = {
+        fund_id: {h.stock_id: float(h.weight) for h in holdings} for fund_id, holdings in holdings_by_fund.items()
+    }
 
     exposure = compute_concentration(fund_holdings, fund_portfolio_weights)
     top_stock_ids = sorted(exposure, key=exposure.get, reverse=True)[:TOP_N_STOCKS]

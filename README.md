@@ -1,98 +1,103 @@
-# ai-shi — Mutual Fund Overlap & Concentration Agent
+# MF-Agent — Mutual Fund Overlap & Allocation Assistant
 
-An agentic system that takes a person's mutual fund holdings (fund names, or a
-folio/consolidated statement), resolves the underlying stock holdings of each
-fund, and calculates overlap between funds — flagging concentration risk (e.g.
-the same large-cap stock showing up at high weight across "different" funds).
+Terminal agent for Indian mutual fund portfolios: fund overlap, portfolio
+concentration, and allocation-gap analysis. Research only — no trades, no
+buy/sell recommendations, no naming specific funds.
 
-This is a research/analysis agent, not a trading agent. **No autonomous trade
-or order execution anywhere in scope.**
+## Features
+
+- **Fund overlap** — % overlap in stock holdings between two funds + top shared holdings
+- **Portfolio concentration** — true blended per-stock exposure across multiple funds
+- **Allocation gap** — current equity/debt/gold split vs. a target split (report-only, no fund suggestions)
+- Fuzzy fund name resolution (typos, missing "Direct Growth" suffix, etc.)
+
+## Status
+
+CLI only (`python -m app.cli`), local SQLite, no server, no deployment.
+Tests: 16 passed, 5 skipped (skipped = hit live APIs, run manually).
+
+Known gaps:
+- Only Groww scraper is implemented; AMFI/Value Research/Moneycontrol are stubs
+- `beautifulsoup4` dep is unused; `prefect` dep has only a stub job
+- `scripts/seed_funds.py` is a stub — DB populates lazily on first use
 
 ## Architecture
 
 ```
-Interactive CLI (app/cli.py) — the only interface
-        |
-Coordinator agent (app/agent/orchestrator.py) — owns the conversation with
-the user (client-side history, held in-process by the CLI); routes questions
-to domain specialists as tools, never answers fund questions itself
-        |
-Domain specialist(s) (app/agent/domains/) — self-contained: own prompt, own
-tools, own one-shot tool-calling loop. Today: overlap_concentration.py
-(fund overlap, portfolio concentration) and allocation_gap.py (current vs.
-target equity/debt/gold split — report-only, never names specific funds
-to buy)
-        |
-Tool layer (app/tools) — deterministic, each returns structured data or a
-                          clear typed failure:
-  - search_fund(query)             resolves fund name -> fund_id via live search
-  - fetch_holdings(fund_id)        cache-first (once/day), falls back to scrapers
-  - fetch_asset_allocation(fund_id) live equity/debt/commodity split (not cached)
-  - scrapers/*                one scraper per data source (Groww implemented;
-                               AMFI, Value Research, Moneycontrol stubs)
-  - compute_overlap(a, b)    sum(min(weight_i, weight_j)) over common stocks
-  - compute_concentration()  aggregate weighted exposure per stock across a
-                              whole portfolio
+CLI (app/cli.py)
+  holds DB session + conversation history for the session
+        │
+Coordinator (app/agent/orchestrator.py)
+  talks to the user, routes to specialists as tools, no fund logic itself
+        │
+Domain specialists (app/agent/domains/)
+  overlap_concentration.py → search_fund, get_fund_overlap, get_portfolio_concentration
+  allocation_gap.py        → search_fund, get_allocation_gap
+  each: own prompt, own tools, own one-shot tool-calling loop
+        │
+Tools (app/tools/) — deterministic, no LLM
+  search_fund, fetch_holdings(_many), fetch_asset_allocation(_many),
+  compute_overlap, compute_concentration
+        │
+SQLite, WAL mode (app/db.py) — funds, stocks, holdings_cache
 ```
 
-Retry/fallback across data sources is a domain agent's judgment call —
-`fetch_holdings` tries scrapers in order and reports success/failure/
-incompleteness back to the agent, which decides whether to try the next
-source or surface the failure to the user.
+**Agent loop** (`app/agent/loop.py`): call model → dispatch any tool calls by
+name → feed results back → repeat, capped at 8 iterations. Shared by
+coordinator and both specialists via `app/agent/tool_registry.py`.
 
-## Stack
+**Why specialists never ask questions**: only the coordinator holds
+conversation history and talks to the user. Specialists run one-shot with no
+reply channel, so they always answer fully and state assumptions instead of
+asking. Coordinator is the only one that can end with a clarifying question.
 
-- **CLI only** (`app/cli.py`, `rich` for terminal rendering) — no HTTP
-  layer, no FastAPI
-- **SQLite (WAL mode)**, async via `aiosqlite` — `funds`, `stocks`,
-  `holdings_cache` tables (`app/models`). No user accounts / no per-user
-  writes; the only writes are the shared daily holdings-cache refresh, so a
-  single SQLite file in WAL mode (concurrent reads, serialized rare writes)
-  is a better fit here than a Postgres server. See `design.md` for the
-  full reasoning and the schema.
-- **Prefect** — scheduled cache-refresh jobs (`app/jobs`)
-- **Gemini API** (`google-genai`, model `gemini-3.8-flash`), hand-rolled
-  tool-calling loop, coordinator + domain-specialist agents
-  (`app/agent`) — no LangGraph/CrewAI for v1
+**Concurrency**: independent network calls (Groww lookups) run concurrently
+via `asyncio.gather`; DB reads/writes stay sequential on one shared
+`AsyncSession` (SQLAlchemy: unsafe to share across coroutines). Pattern:
+resolve what's cached (sequential) → fetch what's missing (concurrent) →
+persist (sequential).
 
-## Data sourcing
+## Data model
 
-No clean official real-time API for Indian MF holdings exists. Groww exposes
-unofficial-but-usable JSON endpoints (fund search + a fund-detail endpoint
-that includes a full weighted holdings list) and is the only implemented
-scraper today. AMFI's monthly disclosure files, Value Research, and
-Moneycontrol remain stubs. See `design.md` for the actual endpoints and the
-quirks found while integrating them.
+```sql
+funds (fund_id UUID PK, name, amc, isin UNIQUE NOT NULL)
 
-## Non-goals (v1)
+stocks (stock_id UUID PK, isin UNIQUE NULL, ticker NULL,
+        external_id UNIQUE NULL, name NOT NULL)
 
-- No trade execution / order placement
-- No real-time/intraday data — the underlying disclosure is monthly-ish
-  regardless of how often we check it
-- No agent framework (LangGraph/CrewAI) — hand-roll the loop first
-- No user accounts / no per-user persisted state
-- No HTTP/API layer — CLI only
+holdings_cache (
+  fund_id, stock_id, as_of_date,   -- PK; as_of_date = source's disclosure date
+  weight, source, fetched_at
+)
+```
+
+`holdings_cache` rows are never deleted (free history). "Already checked
+today" is based on `fetched_at`, not `as_of_date` — the source's disclosure
+date can be weeks old regardless of fetch date. Asset allocation isn't
+cached — always fetched live.
+
+## Data source
+
+Groww's unofficial JSON API (`app/tools/groww_client.py`), reverse-engineered:
+- fund search (`st_p_query`)
+- fund detail + holdings (`v6/scheme/search/{slug}`)
+- portfolio stats + asset allocation (`v1/scheme/portfolio/{scheme_code}/stats` — separate endpoint, keyed by numeric scheme code)
+
+Quirk: search returns nothing if the query includes "Direct Growth" etc. —
+stripped before searching (`groww_lookup.py`).
 
 ## Setup
 
 ```bash
 pip install -e ".[dev]"
-cp .env.example .env   # fill in DATABASE_URL, GEMINI_API_KEY
+cp .env.example .env   # DATABASE_URL, GEMINI_API_KEY
 python -m app.cli
 pytest
 ```
 
-## Status
+## Non-goals
 
-Working end-to-end, verified live: the CLI resolves fund names, fetches live
-holdings/allocation data (Groww), computes overlap/concentration and
-allocation-gap analysis, and Gemini narrates the result through the
-coordinator → domain-specialist routing. Two domains exist so far:
-overlap/concentration and allocation-gap. Conversation memory works across
-turns within a CLI session.
-
-Still stubs: AMFI/Value Research/Moneycontrol scrapers (only Groww is real),
-the Prefect daily refresh job, and portfolio-side weighting (how much of the
-user's money is in each fund — currently supplied per query, no
-persistence). See `design.md` §4 for candidate next domains (goal planning,
-fund performance, tax).
+- No trade execution, no buy/sell recommendations
+- No real-time data — holdings checked at most once/day
+- No agent framework (hand-rolled loop, on purpose)
+- No accounts, no persisted per-user state, no HTTP/API layer

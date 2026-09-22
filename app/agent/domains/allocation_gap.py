@@ -5,9 +5,9 @@ called directly by the user.
 Report-only, by design: this agent computes and explains the gap between a
 user's current blended equity/debt/gold-or-commodity split and their stated
 target, and never names specific funds to buy or sell to close it. Naming
-specific replacement funds is investment advice and out of scope (see
-design.md non-goals) — it may describe what *category* of fund would move
-the allocation in the right direction, nothing more specific than that.
+specific replacement funds is investment advice and out of scope — it may
+describe what *category* of fund would move the allocation in the right
+direction, nothing more specific than that.
 """
 
 import uuid
@@ -20,8 +20,7 @@ from app.agent import tools as coordinator_tools
 from app.agent.loop import run_tool_loop
 from app.agent.tool_registry import make_dispatcher, to_gemini_tools
 from app.config import settings
-from app.tools.fetch_asset_allocation import fetch_asset_allocation
-from app.tools.groww_lookup import FundLookupError
+from app.tools.fetch_asset_allocation import fetch_asset_allocation_many
 
 MODEL = "gemini-3.8-flash"
 
@@ -118,19 +117,25 @@ async def _get_allocation_gap(
     warnings = []
     total_equity = total_debt = total_gold = total_other = 0.0
 
+    fund_id_by_str: dict[uuid.UUID, str] = {}
+    valid_fund_ids: list[uuid.UUID] = []
+    weight_by_id: dict[uuid.UUID, float] = {}
     for fund_id_str, weight in zip(fund_ids, weights):
         try:
             fund_id = uuid.UUID(fund_id_str)
         except ValueError:
             warnings.append(f"'{fund_id_str}' is not a valid fund_id — skipped")
             continue
+        fund_id_by_str[fund_id] = fund_id_str
+        valid_fund_ids.append(fund_id)
+        weight_by_id[fund_id] = weight
 
-        try:
-            alloc = await fetch_asset_allocation(fund_id, session)
-        except (ValueError, FundLookupError) as exc:
-            warnings.append(f"could not fetch allocation for fund_id {fund_id_str}: {exc}")
-            continue
+    allocations, errors = await fetch_asset_allocation_many(valid_fund_ids, session)
+    for fund_id, reason in errors.items():
+        warnings.append(f"could not fetch allocation for fund_id {fund_id_by_str[fund_id]}: {reason}")
 
+    for fund_id, alloc in allocations.items():
+        weight = weight_by_id[fund_id]
         total_equity += weight * alloc["equity_pct"]
         total_debt += weight * alloc["debt_pct"]
         total_gold += weight * alloc["gold_commodity_pct"]

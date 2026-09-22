@@ -67,3 +67,24 @@ class GrowwClient:
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
+
+
+_shared_client: GrowwClient | None = None
+
+
+def get_shared_client() -> GrowwClient:
+    """One GrowwClient for the whole process, reused across every call site.
+    Avoids re-priming (an extra network round-trip for a session cookie) on
+    every single tool call — the previous per-call `async with GrowwClient()`
+    pattern re-primed on every fund lookup, even within the same session."""
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = GrowwClient()
+    return _shared_client
+
+
+async def close_shared_client() -> None:
+    global _shared_client
+    if _shared_client is not None:
+        await _shared_client.aclose()
+        _shared_client = None

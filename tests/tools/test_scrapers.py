@@ -9,12 +9,6 @@ class _FakeGrowwClient:
         self._candidates = candidates
         self._detail = detail
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        return None
-
     async def search_schemes(self, query, size=6):
         return self._candidates
 
@@ -31,7 +25,7 @@ async def test_fetch_reports_incomplete_holdings(monkeypatch):
         "holdings": [{"company_name": "Foo Ltd", "corpus_per": 10.0, "stock_search_id": "foo-ltd"}],
     }
     monkeypatch.setattr(
-        "app.tools.groww_lookup.GrowwClient",
+        "app.tools.groww_lookup.get_shared_client",
         lambda: _FakeGrowwClient(candidates, detail),
     )
 
@@ -44,7 +38,7 @@ async def test_fetch_reports_incomplete_holdings(monkeypatch):
 @pytest.mark.asyncio
 async def test_fetch_reports_no_match(monkeypatch):
     monkeypatch.setattr(
-        "app.tools.groww_lookup.GrowwClient",
+        "app.tools.groww_lookup.get_shared_client",
         lambda: _FakeGrowwClient([], {}),
     )
 

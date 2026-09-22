@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import date, datetime, timezone
 
@@ -23,35 +24,71 @@ async def fetch_holdings(fund_id: uuid.UUID, session: AsyncSession) -> list[Hold
     otherwise try each configured scraper in order until one succeeds,
     persist the result (keyed by the source's own disclosure date, not
     today's date), and return it. Raises RuntimeError with every source's
-    failure reason if all sources fail."""
-    cached = await _get_todays_holdings(session, fund_id)
-    if cached:
-        return cached
+    failure reason if all sources fail. For more than one fund, prefer
+    fetch_holdings_many — it fetches concurrently instead of one at a time."""
+    results = await fetch_holdings_many([fund_id], session)
+    return results[fund_id]
 
-    fund = await session.get(Fund, fund_id)
-    if fund is None:
-        raise ValueError(f"no fund with id {fund_id}")
 
+async def fetch_holdings_many(fund_ids: list[uuid.UUID], session: AsyncSession) -> dict[uuid.UUID, list[HoldingsCache]]:
+    """Same contract as fetch_holdings, for several funds at once. Cache
+    checks and DB writes run sequentially (they share one AsyncSession,
+    which SQLAlchemy documents as unsafe for concurrent use) — but those are
+    fast local SQLite operations. The actual scraping — the slow part, one
+    or more live HTTP round-trips per fund — runs concurrently across every
+    fund that needs a fresh fetch. Raises RuntimeError (from whichever fund
+    failed first) if any fund's scrape fails — same failure contract as
+    fetch_holdings, just applied per fund in the batch."""
+    results: dict[uuid.UUID, list[HoldingsCache]] = {}
+    to_scrape: list[uuid.UUID] = []
+    fund_names: dict[uuid.UUID, str] = {}
+
+    for fund_id in fund_ids:
+        cached = await _get_todays_holdings(session, fund_id)
+        if cached:
+            results[fund_id] = cached
+            continue
+        fund = await session.get(Fund, fund_id)
+        if fund is None:
+            raise ValueError(f"no fund with id {fund_id}")
+        fund_names[fund_id] = fund.name
+        to_scrape.append(fund_id)
+
+    if not to_scrape:
+        return results
+
+    scraped_results = await asyncio.gather(*(_scrape(fund_names[fid]) for fid in to_scrape), return_exceptions=True)
+
+    for fund_id, scraped in zip(to_scrape, scraped_results):
+        if isinstance(scraped, Exception):
+            raise scraped
+        results[fund_id] = await _persist_holdings(session, fund_id, scraped)
+
+    return results
+
+
+async def _scrape(fund_name: str) -> ScrapedHoldings:
+    """Try each configured scraper in order until one succeeds. Pure
+    network — touches no DB session, safe to run concurrently across funds."""
     failures: list[str] = []
     for scraper in SCRAPERS:
         try:
-            result = await scraper.fetch(fund.name)
+            result = await scraper.fetch(fund_name)
         except NotImplementedError:
             failures.append(f"{scraper.name}: not implemented")
             continue
 
         if isinstance(result, ScrapedHoldings):
-            return await _persist_holdings(session, fund_id, result)
+            return result
         failures.append(f"{result.source}: {result.reason}")
 
-    raise RuntimeError(f"could not fetch holdings for '{fund.name}': " + "; ".join(failures))
+    raise RuntimeError(f"could not fetch holdings for '{fund_name}': " + "; ".join(failures))
 
 
 async def _get_todays_holdings(session: AsyncSession, fund_id: uuid.UUID) -> list[HoldingsCache]:
     """A cache hit means: we already checked this fund today. It does NOT mean
     the underlying disclosure changed today — sources publish on their own
-    schedule (see design.md 2.2/2.3) — only that we don't need to re-check
-    again until tomorrow."""
+    schedule — only that we don't need to re-check again until tomorrow."""
     result = await session.execute(
         select(HoldingsCache).where(
             HoldingsCache.fund_id == fund_id,
